@@ -1,7 +1,8 @@
 /**
  * Minimal Splitwise v3.0 REST client.
  * Workers can't run the Python `splitwise` library, so we talk to the
- * Splitwise HTTP API directly. Auth is the personal API key in Bearer mode.
+ * Splitwise HTTP API directly. Auth is a per-user OAuth access token in
+ * Bearer mode — each user's token gives access to their own account only.
  */
 
 const BASE = "https://secure.splitwise.com/api/v3.0";
@@ -46,13 +47,13 @@ interface UserResponse {
 }
 
 export class SplitwiseClient {
-  constructor(private apiKey: string) {}
+  constructor(private accessToken: string) {}
 
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const res = await fetch(`${BASE}${path}`, {
       ...init,
       headers: {
-        Authorization: `Bearer ${this.apiKey}`,
+        Authorization: `Bearer ${this.accessToken}`,
         "Content-Type": "application/json",
         ...(init.headers || {}),
       },
@@ -104,11 +105,39 @@ export class SplitwiseClient {
   }
 
   async createExpense(payload: Record<string, any>): Promise<any> {
-    const r = await this.request<{ expenses?: any[] }>("/create_expense", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-    // Splitwise returns expenses[] with a single entry on success
+    // Splitwise's create_expense endpoint expects FORM-ENCODED fields, with
+    // participant shares in the legacy `users__N__<field>` key format (the
+    // same format the official `splitwise` Python library uses). JSON bodies
+    // are silently accepted but the participants are dropped, which would
+    // produce a misleading success. So we serialize explicitly, and treat
+    // `errors` in the response body as a failure (Splitwise returns HTTP
+    // 200 with an `errors` object on validation errors).
+    const form = new URLSearchParams();
+    for (const [key, value] of Object.entries(payload)) {
+      if (key === "users") continue; // handled below
+      form.set(key, String(value));
+    }
+    for (let i = 0; i < (payload.users?.length ?? 0); i++) {
+      const u = payload.users[i];
+      for (const [k, v] of Object.entries(u)) {
+        form.set(`users__${i}__${k}`, String(v));
+      }
+    }
+
+    const r = await this.request<{ expenses?: any[]; errors?: Record<string, any> }>(
+      "/create_expense",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: form.toString(),
+      }
+    );
+    if (r.errors && Object.keys(r.errors).length > 0) {
+      const msgs = Object.entries(r.errors).flatMap(([k, v]) =>
+        (Array.isArray(v) ? v : [v]).map((m) => `${k}: ${m}`)
+      );
+      throw new Error(`Splitwise a refusé la dépense : ${msgs.join("; ")}`);
+    }
     return (r.expenses && r.expenses[0]) || r;
   }
 }

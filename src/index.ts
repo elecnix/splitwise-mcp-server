@@ -1,231 +1,225 @@
 /**
- * Splitwise MCP Server — Cloudflare Worker
+ * Splitwise MCP Server — Cloudflare Worker (OAuth 2.1 protected)
  *
- * Exposes the Splitwise API as an MCP server over Streamable HTTP,
- * so any MCP client can call it remotely (public, free, no auth on the
- * MCP layer). The Splitwise personal API key lives in a Worker secret
- * (SPLITWISE_API_KEY) and is never exposed to clients.
+ * A PUBLIC MCP server that authenticates EACH user against their OWN
+ * Splitwise account via OAuth 2.0, so no caller can ever act on another
+ * user's account (in particular, not on the owner's account).
  *
- * Tools (8, ported from the Python FastMCP server):
- *   splitwise_test_auth, splitwise_get_groups, splitwise_get_friends,
- *   splitwise_get_expenses, splitwise_create_expense,
- *   splitwise_get_group_balances, splitwise_get_oauth_url,
- *   splitwise_exchange_oauth_code
+ * Security model:
+ *   - The worker holds only the SPLITWISE_CLIENT_ID / SPLITWISE_CLIENT_SECRET
+ *     (application credentials, tied to no user account).
+ *   - A user connecting visits /authorize, is redirected to Splitwise's
+ *     OAuth consent screen, and authorizes THEIR OWN account.
+ *   - The worker exchanges the code for an access token limited to that
+ *     user, stores it encrypted in the OAuth grant (workers-oauth-provider),
+ *     and every Splitwise API call is made with THAT user's token.
+ *   - /mcp is gated by the OAuth provider: no valid token, no MCP access.
+ *
+ * Built on Cloudflare's official @cloudflare/workers-oauth-provider.
  */
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { z } from "zod";
-import { SplitwiseClient } from "./splitwise";
+import {
+  OAuthProvider,
+  AuthorizationError,
+  type AuthRequest,
+  type OAuthHelpers,
+} from "@cloudflare/workers-oauth-provider";
+import { WorkerEntrypoint } from "cloudflare:workers";
+import { handleMcpRequest } from "./mcp";
+
+const SPLITWISE_AUTHORIZE = "https://secure.splitwise.com/oauth/authorize";
+const SPLITWISE_TOKEN = "https://secure.splitwise.com/oauth/token";
+const SPLITWISE_API = "https://secure.splitwise.com/api/v3.0";
 
 export interface Env {
-  SPLITWISE_API_KEY: string;
-  SPLITWISE_CLIENT_ID?: string;
-  SPLITWISE_CLIENT_SECRET?: string;
+  OAUTH_KV: KVNamespace;
+  FLOW_KV: KVNamespace;
+  OAUTH_PROVIDER: OAuthHelpers;
+  SPLITWISE_CLIENT_ID: string;
+  SPLITWISE_CLIENT_SECRET: string;
 }
 
-function getClient(env: Env): SplitwiseClient {
-  if (!env.SPLITWISE_API_KEY) {
-    throw new Error("SPLITWISE_API_KEY secret is not configured on this worker.");
+/** Authenticated application state attached to /mcp requests (encrypted). */
+interface AuthProps {
+  splitwiseUserId: string;
+  splitwiseName: string;
+  splitwiseAccessToken: string;
+}
+
+/**
+ * Protected MCP handler. Runs only after the OAuth provider validated a
+ * bearer token, at which point this.ctx.props holds the authenticated
+ * user's Splitwise access token (their own account).
+ */
+class McpApiHandler extends WorkerEntrypoint<Env, AuthProps> {
+  override async fetch(request: Request): Promise<Response> {
+    try {
+      return await handleMcpRequest(request, this.ctx.props.splitwiseAccessToken);
+    } catch (e: any) {
+      return new Response(JSON.stringify({ error: e?.message ?? String(e) }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      });
+    }
   }
-  return new SplitwiseClient(env.SPLITWISE_API_KEY);
 }
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const server = new McpServer({
-      name: "Splitwise MCP Server",
-      version: "1.0.0",
-    });
+const defaultHandler: ExportedHandler<Env> = {
+  async fetch(request, env) {
+    const url = new URL(request.url);
 
-    registerTools(server, env);
+    if (url.pathname === "/authorize") {
+      return handleAuthorize(request, env);
+    }
+    if (url.pathname === "/callback") {
+      return handleCallback(request, env);
+    }
 
-    // Stateless mode: each request is self-contained (cleanest fit for Workers).
-    const transport = new WebStandardStreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-      enableJsonResponse: true,
-    });
-    await server.connect(transport);
-    return transport.handleRequest(request);
+    return html(
+      200,
+      "<h1>Splitwise MCP</h1><p>Ce serveur MCP est protégé par OAuth : chaque utilisateur " +
+        "se connecte avec son propre compte Splitwise.</p>" +
+        "<p>Connectez le point d'accès <code>/mcp</code> depuis un client MCP " +
+        "(Claude Desktop, mcp-remote, ...) pour être redirigé vers Splitwise.</p>"
+    );
   },
 };
 
-function registerTools(server: McpServer, env: Env) {
-  const client = () => getClient(env);
+export default new OAuthProvider<Env>({
+  apiRoute: "/mcp",
+  apiHandler: McpApiHandler,
+  defaultHandler,
 
-  server.tool("splitwise_test_auth", "Test the Splitwise API connection and display auth info.", {}, async () => {
-    try {
-      const u = await client().getCurrentUser();
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify({
-          status: "✅ Authentification réussie",
-          user: {
-            id: u.id, first_name: u.first_name, last_name: u.last_name,
-            email: u.email, default_currency: (u as any).default_currency,
-            locale: (u as any).locale,
-          },
-        }, null, 2) }],
-      };
-    } catch (e: any) {
-      return { content: [{ type: "text" as const, text: JSON.stringify({ status: "❌ Erreur", error: e.message }, null, 2) }] };
+  authorizeEndpoint: "/authorize",
+  tokenEndpoint: "/oauth/token",
+
+  // Allow MCP clients to register dynamically (Claude Desktop, mcp-remote,
+  // etc.). CIMD gives new clients an even lighter path.
+  clientRegistrationEndpoint: "/oauth/register",
+  clientIdMetadataDocumentEnabled: true,
+
+  resourceMetadata: {
+    resource: "https://splitwise.mcp.marchildon.net/mcp",
+    authorization_servers: ["https://splitwise.mcp.marchildon.net"],
+    scopes_supported: [],
+    resource_name: "Splitwise MCP server (per-user accounts)",
+  },
+});
+
+async function handleAuthorize(request: Request, env: Env): Promise<Response> {
+  let oauthRequest: AuthRequest;
+  try {
+    oauthRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+  } catch (error) {
+    if (!(error instanceof AuthorizationError)) throw error;
+    if (!error.redirectUri) {
+      return html(400, `<p>Requête invalide : ${escapeHtml(error.description)}</p>`);
     }
+    const redirect = new URL(error.redirectUri);
+    redirect.searchParams.set("error", error.code);
+    redirect.searchParams.set("error_description", error.description);
+    if (error.state) redirect.searchParams.set("state", error.state);
+    if (error.issuer) redirect.searchParams.set("iss", error.issuer);
+    return Response.redirect(redirect.toString(), 302);
+  }
+
+  // Persist the pending auth request across the Splitwise hop. The id is
+  // passed to Splitwise as `state` so /callback can recover it.
+  const sessionId = crypto.randomUUID();
+  await env.FLOW_KV.put(`flow:${sessionId}`, JSON.stringify(oauthRequest), {
+    expirationTtl: 600,
   });
 
-  server.tool("splitwise_get_groups", "List all Splitwise groups with their members and balances.", {}, async () => {
-    try {
-      const groups = await client().getGroups();
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify({ groups }, null, 2) }],
-      };
-    } catch (e: any) {
-      return { content: [{ type: "text" as const, text: JSON.stringify({ status: "❌ Erreur", error: e.message }, null, 2) }] };
-    }
+  const sw = new URL(SPLITWISE_AUTHORIZE);
+  sw.searchParams.set("client_id", env.SPLITWISE_CLIENT_ID);
+  sw.searchParams.set("redirect_uri", `${new URL(request.url).origin}/callback`);
+  sw.searchParams.set("response_type", "code");
+  sw.searchParams.set("state", sessionId);
+  return Response.redirect(sw.toString(), 302);
+}
+
+async function handleCallback(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const sessionId = url.searchParams.get("state");
+  const code = url.searchParams.get("code");
+  const oauthError = url.searchParams.get("error");
+
+  if (!sessionId) return html(400, "<p>Session OAuth manquante.</p>");
+  if (oauthError) {
+    if (sessionId) await env.FLOW_KV.delete(`flow:${sessionId}`);
+    return html(
+      400,
+      `<p>Autorisation refusée : ${escapeHtml(url.searchParams.get("error_description") || oauthError)}</p>`
+    );
+  }
+
+  const pending = await env.FLOW_KV.get(`flow:${sessionId}`);
+  await env.FLOW_KV.delete(`flow:${sessionId}`);
+  if (!pending || !code) return html(400, "<p>Code ou session OAuth invalide.</p>");
+
+  let oauthRequest: AuthRequest;
+  try {
+    oauthRequest = JSON.parse(pending);
+  } catch {
+    return html(400, "<p>Session OAuth invalide.</p>");
+  }
+
+  const redirectUri = `${url.origin}/callback`;
+
+  // Exchange the authorization code for the USER's Splitwise access token.
+  const tokenRes = await fetch(SPLITWISE_TOKEN, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      client_id: env.SPLITWISE_CLIENT_ID,
+      client_secret: env.SPLITWISE_CLIENT_SECRET,
+      redirect_uri: redirectUri,
+    }),
+  });
+  const tokenBody: any = await tokenRes.json().catch(() => ({}));
+  if (!tokenRes.ok || !tokenBody?.access_token) {
+    return html(
+      400,
+      `<p>Échec de la connexion à Splitwise : ${escapeHtml(tokenBody?.error_description || tokenBody?.error || `HTTP ${tokenRes.status}`)}</p>`
+    );
+  }
+
+  // Identify the user whose account was authorized.
+  const meRes = await fetch(`${SPLITWISE_API}/get_current_user`, {
+    headers: { Authorization: `Bearer ${tokenBody.access_token}` },
+  });
+  const meBody: any = await meRes.json().catch(() => ({}));
+  const user = meBody?.user || {};
+  const userId = String(user?.id ?? "unknown");
+  const name = [user?.first_name, user?.last_name].filter(Boolean).join(" ").trim() || userId;
+
+  // Complete the MCP-layer OAuth flow and redirect the client back.
+  const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+    request: oauthRequest,
+    userId,
+    metadata: { name },
+    scope: oauthRequest.scope,
+    props: {
+      splitwiseUserId: userId,
+      splitwiseName: name,
+      splitwiseAccessToken: tokenBody.access_token,
+    } satisfies AuthProps,
   });
 
-  server.tool("splitwise_get_friends", "List all Splitwise friends with their balances.", {}, async () => {
-    try {
-      const friends = await client().getFriends();
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify({ friends }, null, 2) }],
-      };
-    } catch (e: any) {
-      return { content: [{ type: "text" as const, text: JSON.stringify({ status: "❌ Erreur", error: e.message }, null, 2) }] };
-    }
-  });
+  return Response.redirect(redirectTo, 302);
+}
 
-  server.tool(
-    "splitwise_get_expenses",
-    "Retrieve expenses with optional filters.",
-    {
-      group_id: z.number().int().optional().describe("Filter by group ID"),
-      friend_id: z.number().int().optional().describe("Filter by friend ID"),
-      limit: z.number().int().default(50).describe("Max results"),
-      offset: z.number().int().default(0).describe("Pagination offset"),
-    },
-    async ({ group_id, friend_id, limit, offset }) => {
-      try {
-        const expenses = await client().getExpenses({ group_id, friend_id, limit, offset });
-        return { content: [{ type: "text" as const, text: JSON.stringify({ expenses }, null, 2) }] };
-      } catch (e: any) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ status: "❌ Erreur", error: e.message }, null, 2) }] };
-      }
-    }
+function html(status: number, body: string): Response {
+  return new Response(
+    `<!doctype html><html lang="fr"><meta charset="utf-8"><body style="font-family:sans-serif;max-width:40em;margin:2em auto">${body}</body></html>`,
+    { status, headers: { "content-type": "text/html;charset=utf-8" } }
   );
+}
 
-  server.tool(
-    "splitwise_create_expense",
-    "Create a new Splitwise expense.",
-    {
-      description: z.string().describe("Description of the expense"),
-      cost: z.number().describe("Total cost of the expense"),
-      currency_code: z.string().default("USD").describe("Currency code (USD, CAD, EUR...)"),
-      group_id: z.number().int().optional().describe("Group ID"),
-      friend_ids: z.array(z.number().int()).optional().describe("Friend user IDs to include"),
-      split_equally: z.boolean().default(true).describe("Split equally among participants"),
-      payment: z.boolean().default(false).describe("Mark as a payment"),
-      details: z.string().optional(),
-      date: z.string().optional().describe("Date YYYY-MM-DD"),
-    },
-    async (args) => {
-      try {
-        const c = client();
-        const current = await c.getCurrentUser();
-        const cost = String(args.cost);
-
-        // Build participants. Default: payer = current user, split among users.
-        const users: Record<string, any>[] = [];
-        const participantIds = args.friend_ids && args.friend_ids.length
-          ? args.friend_ids
-          : [];
-
-        if (!args.group_id && participantIds.length === 0) {
-          throw new Error("Provide either a group_id or friend_ids to split the expense with.");
-        }
-
-        if (participantIds.length > 0) {
-          const share = args.split_equally
-            ? (Number(cost) / (participantIds.length + 1)).toFixed(2)
-            : "0.00";
-          users.push({ user_id: current.id, paid_share: cost, owed_share: args.split_equally ? share : "0.00" });
-          for (const fid of participantIds) {
-            users.push({ user_id: fid, paid_share: "0.00", owed_share: args.split_equally ? share : "0.00" });
-          }
-        } else {
-          // Group expense: current user pays full cost, owes 0; group splits the rest.
-          users.push({ user_id: current.id, paid_share: cost, owed_share: "0.00" });
-        }
-
-        const payload: Record<string, any> = {
-          description: args.description,
-          cost,
-          currency_code: args.currency_code,
-          payment: args.payment,
-          split_equally: args.split_equally ? "true" : "false",
-          users,
-        };
-        if (args.group_id) payload.group_id = args.group_id;
-        if (args.details) payload.details = args.details;
-        if (args.date) payload.date = args.date;
-
-        const created = await c.createExpense(payload);
-        return {
-          content: [{ type: "text" as const, text: JSON.stringify({
-            status: "✅ Dépense créée avec succès",
-            expense: {
-              id: created?.id ?? null,
-              description: created?.description ?? args.description,
-              cost: created?.cost ?? args.cost,
-              currency_code: args.currency_code,
-              group_id: created?.group_id ?? args.group_id ?? null,
-              date: created?.date ?? args.date ?? null,
-            },
-          }, null, 2) }],
-        };
-      } catch (e: any) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ status: "❌ Erreur", error: e.message }, null, 2) }] };
-      }
-    }
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!
   );
-
-  server.tool("splitwise_get_group_balances", "Get balances for all members in a group.", {
-    group_id: z.number().int().describe("The Splitwise group ID"),
-  }, async ({ group_id }) => {
-    try {
-      const group = await client().getGroup(group_id);
-      return { content: [{ type: "text" as const, text: JSON.stringify({ group }, null, 2) }] };
-    } catch (e: any) {
-      return { content: [{ type: "text" as const, text: JSON.stringify({ status: "❌ Erreur", error: e.message }, null, 2) }] };
-    }
-  });
-
-  server.tool("splitwise_get_oauth_url", "Generate an OAuth2 authorization URL (requires SPLITWISE_CLIENT_ID).", {}, async () => {
-    if (!env.SPLITWISE_CLIENT_ID) {
-      return { content: [{ type: "text" as const, text: JSON.stringify({ status: "❌ Erreur", error: "SPLITWISE_CLIENT_ID secret not set" }, null, 2) }] };
-    }
-    const url = `https://secure.splitwise.com/oauth/authorize?response_type=code&client_id=${env.SPLITWISE_CLIENT_ID}&redirect_uri=https://splitwise.mcp.marchildon.net/callback`;
-    return { content: [{ type: "text" as const, text: JSON.stringify({ status: "✅ URL d'autorisation générée", url }, null, 2) }] };
-  });
-
-  server.tool("splitwise_exchange_oauth_code", "Exchange an OAuth2 authorization code for an access token.", {
-    code: z.string().describe("The authorization code from the OAuth callback"),
-  }, async ({ code }) => {
-    const cid = env.SPLITWISE_CLIENT_ID;
-    const secret = env.SPLITWISE_CLIENT_SECRET;
-    if (!cid || !secret) {
-      return { content: [{ type: "text" as const, text: JSON.stringify({ status: "❌ Erreur", error: "SPLITWISE_CLIENT_ID and SPLITWISE_CLIENT_SECRET must be set" }, null, 2) }] };
-    }
-    const r = await fetch("https://secure.splitwise.com/oauth/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        grant_type: "authorization_code",
-        code,
-        client_id: cid,
-        client_secret: secret,
-        redirect_uri: "https://splitwise.mcp.marchildon.net/callback",
-      }),
-    });
-    const t: any = await r.json().catch(() => ({}));
-    return { content: [{ type: "text" as const, text: JSON.stringify({ status: "✅ Token obtenu", access_token: t.access_token ?? "", token_type: t.token_type ?? "" }, null, 2) }] };
-  });
 }

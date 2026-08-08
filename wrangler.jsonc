@@ -2,9 +2,20 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "splitwise-mcp",
   "main": "src/index.ts",
-  "compatibility_date": "2025-04-03",
+  "compatibility_date": "2025-07-01",
+  "compatibility_flags": ["global_fetch_strictly_public"],
   "observability": {
     "enabled": true
   },
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "00000000000000000000000000000000"
+    },
+    {
+      "binding": "FLOW_KV",
+      "id": "00000000000000000000000000000001"
+    }
+  ],
   "vars": {}
 }

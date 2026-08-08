@@ -2,3 +2,5 @@ node_modules/
 .dev.vars
 .wrangler/
 dist/
+wrangler.dev.jsonc
+src/dev_local.ts
