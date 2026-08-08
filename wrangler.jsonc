@@ -1,0 +1,10 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "splitwise-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-04-03",
+  "observability": {
+    "enabled": true
+  },
+  "vars": {}
+}
