@@ -17,5 +17,11 @@
       "id": "2b81c3de584d40c1b7c73157fce31d66"
     }
   ],
+  "routes": [
+    {
+      "pattern": "splitwise.mcp.marchildon.net",
+      "custom_domain": true
+    }
+  ],
   "vars": {}
 }
