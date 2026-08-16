@@ -24,16 +24,25 @@ La clé API personnelle de Splitwise (`SPLITWISE_API_KEY`) **n'est jamais
 utilisée dans ce worker public**. Elle ne sert qu'aux tests locaux
 (`src/dev_local.ts`, gitignoré).
 
-## Outils MCP (6)
+## Outils MCP (8)
 
-- `splitwise_test_auth` — profil de l'utilisateur authentifié
-- `splitwise_get_groups` — groupes avec membres et soldes
-- `splitwise_get_friends` — amis avec soldes
-- `splitwise_get_expenses` — dépenses (filtres : groupe, ami, limite, offset)
-- `splitwise_create_expense` — créer une dépense (participants, partage égal,
-  paiement, devises). Envoi form-encoded (format officiel `users__N__champ`),
-  erreurs Splitwise remontées (jamais de faux succès).
-- `splitwise_get_group_balances` — soldes d'un groupe
+Chaque outil regroupe toutes les actions d'une ressource REST via un paramètre `action` :
+
+- `splitwise_user` — actions : `get_current` (profil), `get` (autre utilisateur),
+  `update` (profil : nom, email, locale, devise)
+- `splitwise_friends` — actions : `list`, `get`, `add` (inviter par email),
+  `add_many` (invitation groupée), `delete`
+- `splitwise_groups` — actions : `list`, `get`, `create`, `delete`, `restore`,
+  `add_user` (par user_id ou email), `remove_user`
+- `splitwise_expenses` — actions : `list`, `get`, `create`, `update`, `delete`,
+  `restore`. Création : partage égal (avec amis ou dans un groupe automatique),
+  partage personnalisé (via `shares`), invitation de nouveaux participants
+  par email. Envoi form-encoded (format `users__N__champ`), erreurs Splitwise
+  remontées.
+- `splitwise_comments` — actions : `list`, `add`, `delete`
+- `splitwise_notifications` — actions : `list`
+- `splitwise_categories` — actions : `list`
+- `splitwise_currencies` — actions : `list`
 
 ## Déploiement
 
