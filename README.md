@@ -1,108 +1,114 @@
 # Splitwise MCP Server (Cloudflare Worker)
 
-Un serveur MCP **public** qui expose l'API Splitwise, protégé par **OAuth 2.1** :
-chaque utilisateur se connecte avec **son propre compte Splitwise**. Personne
-ne peut agir sur le compte d'un autre utilisateur — en particulier pas sur
-celui du propriétaire.
+A **public MCP server** that exposes the Splitwise API, protected by **OAuth 2.1**: each user connects with **their own Splitwise account**. No one can act on another user's account — in particular not on the owner's.
 
-- **Coût : 0 $/mois** (plan gratuit Cloudflare Workers, 100 000 requêtes/jour)
-- **Adresse (prévue) :** `https://splitwise.mcp.marchildon.net/mcp`
-- **Sécurité :** OAuth multi-utilisateur via `@cloudflare/workers-oauth-provider`
-  (implémentation OAuth 2.1 officielle de Cloudflare)
+- **Cost:** $0/mo (Cloudflare Workers free plan, 100,000 requests/day)
+- **Security:** multi-user OAuth via `@cloudflare/workers-oauth-provider` (Cloudflare's official OAuth 2.1 implementation)
+- **Stack:** TypeScript, Cloudflare Workers, KV, `@modelcontextprotocol/sdk`
 
-## Modèle de sécurité
+## Public server
 
-| Élément | Détail |
-|---|---|
-| Serveur public | ne détient **que** `SPLITWISE_CLIENT_ID` + `SPLITWISE_CLIENT_SECRET` (credentials d'application, liés à AUCUN compte) |
-| Chaque utilisateur | autorise son propre compte via l'écran de consentement Splitwise |
-| Token par utilisateur | stocké **chiffré** dans le grant OAuth (KV) par le provider Cloudflare |
-| Appels API Splitwise | toujours faits avec **le token de l'utilisateur authentifié** |
-| `/mcp` | 401 sans token valide (challenge `WWW-Authenticate`) |
-
-La clé API personnelle de Splitwise (`SPLITWISE_API_KEY`) **n'est jamais
-utilisée dans ce worker public**. Elle ne sert qu'aux tests locaux
-(`src/dev_local.ts`, gitignoré).
-
-## Outils MCP (8)
-
-Chaque outil regroupe toutes les actions d'une ressource REST via un paramètre `action` :
-
-- `splitwise_user` — actions : `get_current` (profil), `get` (autre utilisateur),
-  `update` (profil : nom, email, locale, devise)
-- `splitwise_friends` — actions : `list`, `get`, `add` (inviter par email),
-  `add_many` (invitation groupée), `delete`
-- `splitwise_groups` — actions : `list`, `get`, `create`, `delete`, `restore`,
-  `add_user` (par user_id ou email), `remove_user`
-- `splitwise_expenses` — actions : `list`, `get`, `create`, `update`, `delete`,
-  `restore`. Création : partage égal (avec amis ou dans un groupe automatique),
-  partage personnalisé (via `shares`), invitation de nouveaux participants
-  par email. Envoi form-encoded (format `users__N__champ`), erreurs Splitwise
-  remontées.
-- `splitwise_comments` — actions : `list`, `add`, `delete`
-- `splitwise_notifications` — actions : `list`
-- `splitwise_categories` — actions : `list`
-- `splitwise_currencies` — actions : `list`
-
-## Déploiement
-
-### 1. Créer les ressources Cloudflare
+There is a hosted instance at **`https://splitwise.mcp.marchildon.net/mcp`**. Connect any MCP client to it:
 
 ```bash
-wrangler kv namespace create OAUTH_KV   # → noter l'id
-wrangler kv namespace create FLOW_KV    # → noter l'id
+# mcporter
+mcporter config add splitwise https://splitwise.mcp.marchildon.net/mcp --auth oauth
+mcporter list splitwise
 ```
 
-Renseigner les ids dans `wrangler.jsonc` (champs `id` des deux bindings KV).
+For Claude Desktop or other MCP clients, point them at the `/mcp` URL. The first call opens Splitwise's OAuth consent screen; after you approve, the client stores a token scoped to **your** account.
 
-### 2. Secrets
+## Security model
+
+| Element | Detail |
+|---|---|
+| Public server | holds **only** `SPLITWISE_CLIENT_ID` + `SPLITWISE_CLIENT_SECRET` (app credentials, bound to **no** account) |
+| Each user | authorizes their own account via Splitwise's consent screen |
+| Per-user token | stored **encrypted** in the OAuth grant (KV) by the Cloudflare provider |
+| Splitwise API calls | always made with **the authenticated user's token** |
+| `/mcp` | returns 401 without a valid token (`WWW-Authenticate` challenge) |
+
+The personal Splitwise API key (`SPLITWISE_API_KEY`) is **never used** in this worker. It is only for local tool testing (`src/dev_local.ts`, gitignored).
+
+## Tools (8)
+
+One tool per REST resource, dispatching on an `action` argument:
+
+- `splitwise_user` — `get_current` (profile), `get` (another user), `update` (name, email, locale, currency)
+- `splitwise_friends` — `list`, `get`, `add` (invite by email), `add_many`, `delete`
+- `splitwise_groups` — `list`, `get`, `create`, `delete`, `restore`, `add_user` (by `user_id` or email), `remove_user`
+- `splitwise_expenses` — `list`, `get`, `create`, `update`, `delete`, `restore`. Creation supports equal splits (friends or auto-split within a group), custom shares via `shares` (by `user_id` or email — email invites new participants), and solo personal expenses. Form-encoded (`users__N__field`), Splitwise errors surfaced (never a false success).
+- `splitwise_comments` — `list`, `add`, `delete`
+- `splitwise_notifications` — `list`
+- `splitwise_categories` — `list`
+- `splitwise_currencies` — `list`
+
+This covers **every endpoint** of the Splitwise OpenAPI spec ([dev.splitwise.com](https://dev.splitwise.com)).
+
+## Self-hosting
+
+This is a Cloudflare Worker. To run your own instance:
+
+### 1. Create the KV namespaces
+
+```bash
+wrangler kv namespace create OAUTH_KV   # note the id
+wrangler kv namespace create FLOW_KV    # note the id
+```
+
+Put the ids in `wrangler.jsonc` (the `id` fields of the two KV bindings).
+
+### 2. Set the secrets
 
 ```bash
 wrangler secret put SPLITWISE_CLIENT_ID
 wrangler secret put SPLITWISE_CLIENT_SECRET
 ```
 
-### 3. Enregistrer la redirection dans Splitwise
+### 3. Register the OAuth app in Splitwise
 
-Dans les réglages de l'application Splitwise (client OAuth), ajouter les
-redirections :
+In your Splitwise OAuth app settings, add your redirect URIs:
 
-- `https://splitwise.mcp.marchildon.net/callback` (production)
-- `http://localhost:8788/callback` (tests locaux)
+- `https://<your-domain>/callback` (production)
+- `http://localhost:8788/callback` (local development)
 
-### 4. Déployer + DNS
-
-```bash
-npm run deploy
-wrangler deploy --routes '[{"pattern":"splitwise.mcp.marchildon.net/*","custom_domain":true}]'
-```
-
-### 5. Vérifier
-
-```bash
-curl -i -X POST https://splitwise.mcp.marchildon.net/mcp -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
-# → attendu : 401 + WWW-Authenticate (aucun accès sans OAuth)
-```
-
-## Tests locaux
+### 4. Deploy
 
 ```bash
 npm install
-# serveur réel (OAuth) sur :8788 — vérifier 401, métadonnées, redirection
+npm run deploy
+```
+
+To use a custom domain, add a route in `wrangler.jsonc`:
+
+```jsonc
+"routes": [{ "pattern": "mcp.example.com", "custom_domain": true }]
+```
+
+### 5. Verify
+
+```bash
+curl -i -X POST https://<your-domain>/mcp -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+# → expected: 401 + WWW-Authenticate (no access without OAuth)
+```
+
+## Local development
+
+```bash
+npm install
+# real OAuth server on :8788 — check 401, metadata, redirect
 npx wrangler dev --local --port 8788
-# harness de tests des outils sur :8787 (clé perso locale, gitignoré)
+# tool-testing harness on :8787 (personal key, gitignored)
 npx wrangler dev --local --config wrangler.dev.jsonc --port 8787
 ```
 
-## Vérifications effectuées
+## Verification
 
 - Bundle OK (`wrangler deploy --dry-run`)
-- Les 6 outils testés contre l'API Splitwise réelle (auth, groupes, amis,
-  dépenses, création + suppression d'une dépense de test, soldes)
-- `POST /mcp` non authentifié → **401 + challenge Bearer**
-- Métadonnées OAuth (RFC 8414 / RFC 9728) correctes, PKCE S256
-- Enregistrement client dynamique (RFC 7591) OK
-- `/authorize` → redirection vers `secure.splitwise.com/oauth/authorize`
-  (consentement Splitwise pour le compte de l'utilisateur)
+- All endpoints tested against the real Splitwise API (auth, groups, friends, expenses, create + delete of a test expense, balances)
+- Unauthenticated `POST /mcp` → **401 + Bearer challenge**
+- OAuth metadata (RFC 8414 / RFC 9728) correct, PKCE S256
+- Dynamic client registration (RFC 7591) OK
+- `/authorize` → redirect to `secure.splitwise.com/oauth/authorize` (Splitwise consent for the user's account)
