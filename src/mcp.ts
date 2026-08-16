@@ -12,6 +12,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 import { SplitwiseClient } from "./splitwise";
+import { buildCreateExpensePayload, type CreateExpenseArgs } from "./expense";
 
 /**
  * Run the MCP server for a single authenticated user's Splitwise token.
@@ -113,55 +114,37 @@ export function registerTools(server: McpServer, client: SplitwiseClient) {
       description: z.string().describe("Description of the expense"),
       cost: z.number().describe("Total cost of the expense"),
       currency_code: z.string().default("USD").describe("Currency code (USD, CAD, EUR...)"),
-      group_id: z.number().int().optional().describe("Group ID"),
+      group_id: z.number().int().optional().describe("Group ID (0 = non-grouped)"),
       friend_ids: z.array(z.number().int()).optional().describe("Friend user IDs to include"),
-      split_equally: z.boolean().default(true).describe("Split equally among participants"),
+      split_equally: z.boolean().default(true).describe("Split equally among participants (default true; ignored when 'shares' is provided)"),
       payment: z.boolean().default(false).describe("Mark as a payment"),
       details: z.string().optional(),
       date: z.string().optional().describe("Date YYYY-MM-DD"),
+      shares: z
+        .array(
+          z.object({
+            user_id: z.number().int().describe("Splitwise user ID"),
+            paid_share: z.union([z.number(), z.string()]).describe("Amount paid by this user"),
+            owed_share: z.union([z.number(), z.string()]).describe("Amount owed by this user"),
+          })
+        )
+        .optional()
+        .describe(
+          "Explicit per-user shares (overrides automatic split; must include the current user)"
+        ),
     },
     async (args) => {
       try {
         const current = await client.getCurrentUser();
-        const cost = String(args.cost);
-
-        const participantIds = args.friend_ids && args.friend_ids.length ? args.friend_ids : [];
-        if (!args.group_id && participantIds.length === 0) {
-          throw new Error("Provide either a group_id or friend_ids to split the expense with.");
+        if (current.id === undefined) {
+          throw new Error(
+            "Impossible de déterminer l'utilisateur courant (id manquant)."
+          );
         }
-
-        const users: Record<string, any>[] = [];
-        if (participantIds.length > 0) {
-          const n = participantIds.length + 1;
-          const shareCents = Math.round((Number(cost) * 100) / n);
-          const share = (shareCents / 100).toFixed(2);
-          // Exact remainder on the last participant so the cost adds up to the cent.
-          const remainder = (Number(cost) - shareCents * (n - 1) / 100).toFixed(2);
-          users.push({ user_id: current.id, paid_share: cost, owed_share: args.split_equally ? share : "0.00" });
-          for (let i = 0; i < participantIds.length; i++) {
-            const isLast = i === participantIds.length - 1;
-            users.push({
-              user_id: participantIds[i],
-              paid_share: "0.00",
-              owed_share: args.split_equally ? (isLast ? remainder : share) : "0.00",
-            });
-          }
-        } else {
-          users.push({ user_id: current.id, paid_share: cost, owed_share: "0.00" });
-        }
-
-        const payload: Record<string, any> = {
-          description: args.description,
-          cost,
-          currency_code: args.currency_code,
-          payment: args.payment,
-          split_equally: args.split_equally ? "true" : "false",
-          users,
-        };
-        if (args.group_id) payload.group_id = args.group_id;
-        if (args.details) payload.details = args.details;
-        if (args.date) payload.date = args.date;
-
+        const payload = buildCreateExpensePayload(
+          args as CreateExpenseArgs,
+          current.id
+        );
         const created = await client.createExpense(payload);
         return jsonOut({
           status: "✅ Dépense créée avec succès",
