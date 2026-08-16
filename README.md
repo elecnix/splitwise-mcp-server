@@ -1,5 +1,7 @@
 # Splitwise MCP Server (Cloudflare Worker)
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/elecnix/splitwise-mcp-server)
+
 A **public MCP server** that exposes the Splitwise API, protected by **OAuth 2.1**: each user connects with **their own Splitwise account**. No one can act on another user's account — in particular not on the owner's.
 
 - **Cost:** $0/mo (Cloudflare Workers free plan, 100,000 requests/day)
