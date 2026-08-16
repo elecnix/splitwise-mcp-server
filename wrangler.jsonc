@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "splitwise-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-07-01",
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  "observability": {
+    "enabled": true
+  },
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "8d785be82574430b949b91107639b9da"
+    },
+    {
+      "binding": "FLOW_KV",
+      "id": "2b81c3de584d40c1b7c73157fce31d66"
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "splitwise.mcp.marchildon.net",
+      "custom_domain": true
+    }
+  ],
+  "vars": {}
+}
